@@ -22,6 +22,9 @@ sudo /opt/setup-xboard-timer.sh
 
 ```
 > 执行后会：
+> 
 > 在 /etc/systemd/system/ 自动创建 .service 和 .timer
+> 
 > 启用并立即启动定时器
+> 
 > 每天凌晨 3 点自动运行 /usr/local/bin/xboard-restart
