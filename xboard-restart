@@ -1,0 +1,131 @@
+#!/bin/bash
+# ------------------------------------------------------------------
+# Xboard + MariaDB 一键智能安全重启脚本（v3.1 稳定版）
+# 作者: 胡博涵
+# 特性: 并发锁 + 智能容器识别 + 优先级 + 健康检测 + 自动清理
+# ------------------------------------------------------------------
+
+set -euo pipefail
+
+LOCK_FILE="/tmp/xboard-restart.lock"
+LOG_FILE="/var/log/xboard-restart.log"
+PROJECT="${PROJECT:-xboard}"
+XBOARD_IMAGE_PREFIX="${XBOARD_IMAGE_PREFIX:-ghcr.io/cedar2025/xboard}"
+REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+
+# === 🔒 并发锁（自动释放 + 超时清理）===
+if [ -f "$LOCK_FILE" ] && find "$LOCK_FILE" -mmin +5 >/dev/null 2>&1; then
+  echo "[$(date '+%F %T')] [WARN] 发现过期锁文件，自动清理。" | tee -a "$LOG_FILE"
+  rm -f "$LOCK_FILE"
+fi
+
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+  echo "[$(date '+%F %T')] ⚠️ 已有一个重启任务在运行，退出。" | tee -a "$LOG_FILE"
+  exit 0
+fi
+
+cleanup_lock() {
+  flock -u 200 || true
+  rm -f "$LOCK_FILE"
+}
+trap cleanup_lock EXIT INT TERM
+
+# === 📜 日志函数 ===
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+
+# === 日志归档（>20MB 自动备份）===
+if [ -f "$LOG_FILE" ] && [ "$(du -m "$LOG_FILE" | cut -f1)" -gt 20 ]; then
+  mv "$LOG_FILE" "${LOG_FILE}.$(date +%F-%H%M%S).bak"
+fi
+
+log "=== 🚀 开始执行 Xboard + MariaDB 一键重启 ==="
+
+# === 1️⃣ 检查 Docker 服务状态 ===
+if ! systemctl is-active --quiet docker; then
+  log "[WARN] Docker 未运行，尝试启动..."
+  systemctl start docker
+  sleep 3
+fi
+if ! docker info >/dev/null 2>&1; then
+  log "[WARN] Docker 守护进程未响应，尝试重启..."
+  systemctl restart docker
+  sleep 5
+fi
+
+# === 2️⃣ 智能发现容器 ===
+discover_containers() {
+  local list=""
+  local lbl="com.docker.compose.project=${PROJECT}"
+
+  # 基于 docker-compose label
+  if docker ps --filter "label=${lbl}" --format '{{.Names}}' | grep -q .; then
+    list="$(docker ps --filter "label=${lbl}" --format '{{.Names}}')"
+  fi
+
+  # 镜像匹配兜底
+  local by_image="$(docker ps --filter "ancestor=${XBOARD_IMAGE_PREFIX}" --format '{{.Names}}')"
+  local by_redis="$(docker ps --filter "ancestor=${REDIS_IMAGE}" --format '{{.Names}}')"
+
+  printf "%s\n%s\n%s\n" "$list" "$by_image" "$by_redis" | awk 'NF{seen[$0]++}END{for(k in seen)print k}' | sort
+}
+
+# === 3️⃣ 智能优先级排序（支持 web/frontend/php/horizon/redis 等）===
+prioritize_containers() {
+  awk '
+    /web|frontend|nginx/   {print "1\t"$0; next}
+    /php|fpm/              {print "2\t"$0; next}
+    /horizon|queue|worker/ {print "3\t"$0; next}
+    /redis/                {print "9\t"$0; next}
+    {print "5\t"$0}
+  ' | sort -k1,1n | cut -f2-
+}
+
+log "🔍 智能检测容器中..."
+mapfile -t CONTAINERS < <(discover_containers | prioritize_containers)
+
+if [ ${#CONTAINERS[@]} -eq 0 ]; then
+  log "⚠️ 未发现匹配容器（PROJECT=$PROJECT, IMAGE_PREFIX=$XBOARD_IMAGE_PREFIX）"
+else
+  log "发现容器：${CONTAINERS[*]}"
+  # === 4️⃣ 重启容器 ===
+  for container in "${CONTAINERS[@]}"; do
+    if docker ps --format '{{.Names}}' | grep -qx "$container"; then
+      log "→ 正在重启 $container ..."
+      docker restart "$container" >/dev/null 2>&1 \
+        && log "✅ $container 重启完成" \
+        || log "❌ $container 重启失败"
+    else
+      log "→ 容器 $container 未运行，尝试启动..."
+      docker start "$container" >/dev/null 2>&1 \
+        && log "✅ $container 启动完成" \
+        || log "❌ $container 启动失败"
+    fi
+  done
+fi
+
+# === 5️⃣ 检查异常容器 ===
+bad=$(docker ps --filter "health=unhealthy" --filter "status=dead" --format '{{.Names}}')
+if [ -n "$bad" ]; then
+  log "⚠️ 以下容器处于异常状态：$bad"
+fi
+
+# === 6️⃣ 重启数据库服务（mariadb / mysql）===
+for svc in mariadb mysql; do
+  if systemctl list-unit-files | grep -q "^$svc.service"; then
+    log "🔄 检测到数据库服务 $svc，正在重启..."
+    systemctl restart "$svc" && log "✅ $svc 重启完成" || log "❌ $svc 重启失败"
+    break
+  fi
+done
+
+# === 7️⃣ 清理 Docker 资源 ===
+log "🧹 清理无用 Docker 资源..."
+docker system prune -f >/dev/null 2>&1
+
+# === 8️⃣ 输出容器状态 ===
+log "📦 当前运行中的容器："
+docker ps --format "table {{.Names}}\t{{.Status}}" | tee -a "$LOG_FILE"
+
+log "✅ 全部重启完成。日志已保存至：$LOG_FILE"
+exit 0
